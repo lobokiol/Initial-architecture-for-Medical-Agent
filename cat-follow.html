@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>会跟着鼠标看的猫咪 · Cat Follow Cursor</title>
+
+<!--
+  ============================================================
+  会跟着鼠标看的猫咪
+  ============================================================
+  实现原理：
+    1. 把猫咪拆成多层（SVG <g> 分组）：
+         · body      —— 身体 / 背景层（不动）
+         · head      —— 头部（围绕颈部做轻微倾斜）
+         · sclera    —— 眼白（不动，作为瞳孔的“容器”）
+         · pupil     —— 瞳孔（在眼白范围内向鼠标方向偏移）
+    2. 监听 mousemove，用 atan2(dy, dx) 计算鼠标相对“猫脸中心”的角度，
+       再用三角函数把这个角度映射到：
+         · 头部旋转角度（限制 ±MAX_HEAD_TILT 度）
+         · 瞳孔在椭圆轨迹内的偏移量（限制 ±MAX_PUPIL_OFFSET 像素）
+    3. 通过 CSS transition 让所有变化都平滑过渡。
+    4. 用 CSS keyframes 实现周期性眨眼动画，并叠加随机额外眨眼。
+
+  备注（替换为真实照片时）：
+    · 把 <g id="cat-body"> 里的形状换成 <image href="你的照片.jpg" .../>
+    · 把 <g id="cat-head"> 里的“头”形状换成头部裁切后的图片（PNG，去背景）
+    · 在两只眼睛的位置上保留 sclera + pupil 的 <ellipse>，并把 cx/cy
+      调整到照片里眼睛的实际像素位置即可。
+    · CSS 变量 --eye-radius-x / --eye-radius-y 控制瞳孔可移动范围。
+  ============================================================
+-->
+
+<style>
+  /* -------------------- 基础重置 -------------------- */
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+
+  body {
+    /* 柔和的渐变背景，让猫咪更有“氛围感” */
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                 "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: #f5f5f7;
+    background: radial-gradient(ellipse at top,    #2b3447 0%, #161a26 60%, #0c0f17 100%);
+    overflow: hidden;            /* 不出现滚动条，全屏更友好 */
+    user-select: none;
+    cursor: crosshair;           /* 提示用户“鼠标在追踪” */
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
+    padding: 32px 24px;
+  }
+
+  /* -------------------- 标题与提示 -------------------- */
+  header {
+    text-align: center;
+    z-index: 2;
+  }
+  header h1 {
+    margin: 0;
+    font-size: clamp(22px, 3vw, 36px);
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    background: linear-gradient(90deg, #ffd6a5, #ffadad, #bdb2ff);
+    -webkit-background-clip: text;
+            background-clip: text;
+    color: transparent;
+  }
+  header p {
+    margin: 8px 0 0;
+    font-size: clamp(13px, 1.2vw, 15px);
+    opacity: 0.7;
+  }
+
+  footer {
+    z-index: 2;
+    font-size: 13px;
+    opacity: 0.55;
+    text-align: center;
+  }
+  footer kbd {
+    background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-family: inherit;
+  }
+
+  /* -------------------- 猫咪舞台 -------------------- */
+  .stage {
+    flex: 1;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+
+  /* 地面光晕，让猫像浮在光圈里 */
+  .stage::before {
+    content: "";
+    position: absolute;
+    bottom: 6%;
+    width: 60%;
+    height: 80px;
+    background: radial-gradient(ellipse at center, rgba(255,210,180,0.18), transparent 70%);
+    filter: blur(4px);
+  }
+
+  .cat {
+    width: min(72vmin, 560px);
+    height: auto;
+    /* 把变换原点放在“脖子”位置，倾斜更自然 */
+    transform-origin: 50% 78%;
+    filter: drop-shadow(0 30px 30px rgba(0,0,0,0.45));
+  }
+
+  /* 头部围绕脖子做轻微倾斜，由 JS 通过 CSS 变量驱动 */
+  #cat-head {
+    transform-box: fill-box;
+    transform-origin: 50% 95%;       /* 头部底部（脖子位置） */
+    transform: rotate(var(--head-tilt, 0deg));
+    transition: transform 220ms cubic-bezier(0.22, 0.61, 0.36, 1);
+  }
+
+  /* 瞳孔在眼白椭圆范围内做平移 */
+  .pupil {
+    transform-box: fill-box;
+    transform-origin: center;
+    transform: translate(var(--pupil-x, 0px), var(--pupil-y, 0px));
+    transition: transform 160ms cubic-bezier(0.22, 0.61, 0.36, 1);
+  }
+
+  /* -------------------- 眨眼动画 --------------------
+     用 scaleY 把整只眼睛压扁来模拟眨眼。
+     transform-origin 设为眼睛中心，使闭合方向上下对称。 */
+  .eye {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: blink 6s infinite;
+  }
+  .eye.right { animation-delay: 0.05s; }   /* 两眼几乎同时眨，但有 50ms 错开更自然 */
+
+  @keyframes blink {
+    0%, 92%, 100% { transform: scaleY(1); }
+    94%           { transform: scaleY(0.05); }
+    96%           { transform: scaleY(1); }
+  }
+
+  /* 高光小白点：一直跟着瞳孔走，让眼睛“活” */
+  .glint {
+    pointer-events: none;
+  }
+
+  /* -------------------- 响应式 -------------------- */
+  @media (max-width: 600px) {
+    body { padding: 20px 12px; }
+    .cat { width: 86vmin; }
+  }
+</style>
+</head>
+
+<body>
+
+<header>
+  <h1>盯着你看的小猫咪</h1>
+  <p>移动鼠标，它会用眼睛和小脑袋追着你 ✨</p>
+</header>
+
+<div class="stage">
+  <!--
+    SVG 视图框 600 × 720（宽 600 高 720）。
+    所有坐标都基于这个内部坐标系，与浏览器窗口大小无关。
+  -->
+  <svg class="cat" viewBox="0 0 600 720" xmlns="http://www.w3.org/2000/svg" aria-label="一只可爱的小猫">
+
+    <!-- ============== 渐变与滤镜定义 ============== -->
+    <defs>
+      <!-- 身体毛色：暖灰渐变 -->
+      <radialGradient id="furBody" cx="50%" cy="40%" r="70%">
+        <stop offset="0%"  stop-color="#a89484"/>
+        <stop offset="60%" stop-color="#7a6757"/>
+        <stop offset="100%" stop-color="#3e352d"/>
+      </radialGradient>
+
+      <!-- 头部毛色：稍亮一些 -->
+      <radialGradient id="furHead" cx="50%" cy="35%" r="75%">
+        <stop offset="0%"  stop-color="#d6c2af"/>
+        <stop offset="55%" stop-color="#9a8472"/>
+        <stop offset="100%" stop-color="#4a3f34"/>
+      </radialGradient>
+
+      <!-- 耳朵内部粉色 -->
+      <radialGradient id="earInner" cx="50%" cy="60%" r="60%">
+        <stop offset="0%"  stop-color="#f6c6c0"/>
+        <stop offset="100%" stop-color="#a86a66"/>
+      </radialGradient>
+
+      <!-- 鼻子 -->
+      <radialGradient id="nose" cx="40%" cy="35%" r="70%">
+        <stop offset="0%"  stop-color="#ffb3b8"/>
+        <stop offset="100%" stop-color="#8a3a44"/>
+      </radialGradient>
+
+      <!-- 虹膜：琥珀绿 -->
+      <radialGradient id="iris" cx="50%" cy="50%" r="55%">
+        <stop offset="0%"  stop-color="#e8d36a"/>
+        <stop offset="55%" stop-color="#7aa55a"/>
+        <stop offset="100%" stop-color="#2c4a2c"/>
+      </radialGradient>
+
+      <!-- 眼白偏淡黄绿（贴近真实猫眼） -->
+      <radialGradient id="sclera" cx="50%" cy="50%" r="60%">
+        <stop offset="0%"  stop-color="#f7f1cc"/>
+        <stop offset="100%" stop-color="#bfae72"/>
+      </radialGradient>
+
+      <!-- 用于头/身柔和阴影 -->
+      <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+        <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
+        <feOffset dx="0" dy="6" result="offsetblur"/>
+        <feComponentTransfer><feFuncA type="linear" slope="0.45"/></feComponentTransfer>
+        <feMerge>
+          <feMergeNode/>
+          <feMergeNode in="SourceGraphic"/>
+        </feMerge>
+      </filter>
+    </defs>
+
+    <!-- ============== 1. 身体（不动） ============== -->
+    <g id="cat-body" filter="url(#softShadow)">
+      <!-- 坐姿身体：一个胖胖的椭圆 -->
+      <ellipse cx="300" cy="600" rx="200" ry="110" fill="url(#furBody)"/>
+      <!-- 前胸 / 围裙：浅色斑块 -->
+      <ellipse cx="300" cy="610" rx="90" ry="60" fill="#e8d8c4" opacity="0.85"/>
+      <!-- 左前爪 -->
+      <ellipse cx="220" cy="680" rx="48" ry="28" fill="#5a4a3c"/>
+      <ellipse cx="220" cy="676" rx="40" ry="20" fill="#7a6757"/>
+      <!-- 右前爪 -->
+      <ellipse cx="380" cy="680" rx="48" ry="28" fill="#5a4a3c"/>
+      <ellipse cx="380" cy="676" rx="40" ry="20" fill="#7a6757"/>
+      <!-- 尾巴：从身体右侧绕到前面 -->
+      <path d="M 470,640 Q 560,600 540,520 Q 520,470 460,490"
+            fill="none" stroke="#5a4a3c" stroke-width="34" stroke-linecap="round"/>
+      <path d="M 470,640 Q 560,600 540,520 Q 520,470 460,490"
+            fill="none" stroke="#8a7565" stroke-width="22" stroke-linecap="round"/>
+    </g>
+
+    <!-- ============== 2. 头部（会倾斜）==============
+         注意：把头放在 cat-body 之上以遮住脖子接缝。
+         transform-origin 在 CSS 里设置为 fill-box 的下方中心 = “脖子”。 -->
+    <g id="cat-head">
+
+      <!-- ---------- 耳朵 ---------- -->
+      <g id="ears">
+        <!-- 左耳 -->
+        <path d="M 170,260 L 145,140 L 245,225 Z"
+              fill="url(#furHead)" stroke="#3a302a" stroke-width="2"/>
+        <path d="M 180,250 L 165,170 L 230,225 Z" fill="url(#earInner)"/>
+        <!-- 右耳 -->
+        <path d="M 430,260 L 455,140 L 355,225 Z"
+              fill="url(#furHead)" stroke="#3a302a" stroke-width="2"/>
+        <path d="M 420,250 L 435,170 L 370,225 Z" fill="url(#earInner)"/>
+      </g>
+
+      <!-- ---------- 头颅 ---------- -->
+      <!-- 主体头部（略宽于高，符合猫脸比例） -->
+      <ellipse cx="300" cy="340" rx="170" ry="155" fill="url(#furHead)"
+               stroke="#3a302a" stroke-width="2"/>
+
+      <!-- 脸颊蓬松毛簇（左右两边的“腮帮子”） -->
+      <ellipse cx="170" cy="400" rx="55" ry="40" fill="#c2ad96" opacity="0.85"/>
+      <ellipse cx="430" cy="400" rx="55" ry="40" fill="#c2ad96" opacity="0.85"/>
+
+      <!-- 额头中间淡色 M 纹（虎斑特征） -->
+      <path d="M 270,210 Q 280,250 300,255 Q 320,250 330,210"
+            fill="none" stroke="#3a302a" stroke-width="3" opacity="0.55"/>
+      <path d="M 250,225 Q 260,275 285,290" fill="none"
+            stroke="#3a302a" stroke-width="2.5" opacity="0.45"/>
+      <path d="M 350,225 Q 340,275 315,290" fill="none"
+            stroke="#3a302a" stroke-width="2.5" opacity="0.45"/>
+
+      <!-- ---------- 眼睛 ---------- -->
+      <!--
+        每只眼由：
+          · sclera  眼白 / 虹膜（不动）
+          · pupil   瞳孔（被 JS 平移）
+          · glint   高光（跟随瞳孔，CSS 变量同步）
+        外层 <g class="eye"> 用来做眨眼缩放。
+      -->
+
+      <!-- 左眼 -->
+      <g class="eye left">
+        <!-- 眼白 / 巩膜 -->
+        <ellipse class="sclera" cx="240" cy="340" rx="36" ry="30" fill="url(#sclera)"/>
+        <!-- 虹膜（黄绿） -->
+        <ellipse cx="240" cy="340" rx="26" ry="26" fill="url(#iris)"/>
+        <!-- 瞳孔（细长椭圆，更像猫） -->
+        <ellipse class="pupil" data-side="left"
+                 cx="240" cy="340" rx="7" ry="22" fill="#0a0a0a"/>
+        <!-- 高光：CSS 里通过 var(--pupil-x/y) 也跟着移动 -->
+        <circle class="glint" data-side="left"
+                cx="234" cy="332" r="4" fill="#ffffff" opacity="0.9"
+                style="transform: translate(var(--pupil-x,0px), var(--pupil-y,0px));
+                       transform-box: fill-box; transform-origin: center;
+                       transition: transform 160ms cubic-bezier(0.22,0.61,0.36,1);"/>
+      </g>
+
+      <!-- 右眼 -->
+      <g class="eye right">
+        <ellipse class="sclera" cx="360" cy="340" rx="36" ry="30" fill="url(#sclera)"/>
+        <ellipse cx="360" cy="340" rx="26" ry="26" fill="url(#iris)"/>
+        <ellipse class="pupil" data-side="right"
+                 cx="360" cy="340" rx="7" ry="22" fill="#0a0a0a"/>
+        <circle class="glint" data-side="right"
+                cx="354" cy="332" r="4" fill="#ffffff" opacity="0.9"
+                style="transform: translate(var(--pupil-x,0px), var(--pupil-y,0px));
+                       transform-box: fill-box; transform-origin: center;
+                       transition: transform 160ms cubic-bezier(0.22,0.61,0.36,1);"/>
+      </g>
+
+      <!-- ---------- 鼻子 / 嘴巴 ---------- -->
+      <path d="M 285,410 Q 300,425 315,410 Q 308,428 300,430 Q 292,428 285,410 Z"
+            fill="url(#nose)" stroke="#5a2a30" stroke-width="1.5"/>
+
+      <!-- 人中 -->
+      <path d="M 300,430 L 300,448" stroke="#3a302a" stroke-width="2"/>
+      <!-- 嘴巴：两个对称的小弧 -->
+      <path d="M 300,448 Q 285,468 270,455" fill="none"
+            stroke="#3a302a" stroke-width="2.5" stroke-linecap="round"/>
+      <path d="M 300,448 Q 315,468 330,455" fill="none"
+            stroke="#3a302a" stroke-width="2.5" stroke-linecap="round"/>
+
+      <!-- ---------- 胡须 ---------- -->
+      <g stroke="#efe6d4" stroke-width="1.6" stroke-linecap="round" opacity="0.85">
+        <line x1="170" y1="430" x2="80"  y2="410"/>
+        <line x1="170" y1="445" x2="75"  y2="450"/>
+        <line x1="170" y1="460" x2="82"  y2="488"/>
+        <line x1="430" y1="430" x2="520" y2="410"/>
+        <line x1="430" y1="445" x2="525" y2="450"/>
+        <line x1="430" y1="460" x2="518" y2="488"/>
+      </g>
+
+    </g><!-- /cat-head -->
+  </svg>
+</div>
+
+<footer>
+  把鼠标移到屏幕任意位置 · 按 <kbd>空格</kbd> 让它眨一下眼
+</footer>
+
+<script>
+/* ============================================================
+   交互逻辑：让头/眼睛跟随鼠标
+   ============================================================ */
+(() => {
+  // ----- 可调参数 -----
+  const MAX_HEAD_TILT     = 8;     // 头部最大倾斜角度（度）
+  const MAX_PUPIL_OFFSET_X = 9;    // 瞳孔水平最大偏移（px，SVG 坐标）
+  const MAX_PUPIL_OFFSET_Y = 7;    // 瞳孔垂直最大偏移（px，SVG 坐标）
+  const FOLLOW_DISTANCE   = 600;   // 距离多少像素时偏移“满格”
+
+  // ----- 取关键元素 -----
+  const cat       = document.querySelector('.cat');
+  const head      = document.getElementById('cat-head');
+  const pupils    = document.querySelectorAll('.pupil, .glint');
+
+  /* 把数值限制在 [-limit, limit] */
+  const clamp = (v, limit) => Math.max(-limit, Math.min(limit, v));
+
+  /* 主跟随函数 */
+  function follow(clientX, clientY) {
+    /* 1. 找到“猫脸中心”在屏幕上的像素坐标。
+          这里直接用猫的外接 rect 中心当作参考点，简单可靠。 */
+    const r = cat.getBoundingClientRect();
+    const cx = r.left + r.width  * 0.5;
+    const cy = r.top  + r.height * 0.42;   // 略偏上（眼睛大概在 42% 高度）
+
+    /* 2. 鼠标相对中心的方向向量 */
+    const dx = clientX - cx;
+    const dy = clientY - cy;
+
+    /* 3. 用 atan2 得到角度（弧度），便于后续按角度做几何运算 */
+    const angle = Math.atan2(dy, dx);
+
+    /* 4. 距离归一化为 0..1（决定瞳孔偏移强度，不让远处“空看”） */
+    const dist  = Math.min(Math.hypot(dx, dy) / FOLLOW_DISTANCE, 1);
+
+    /* 5. 头部倾斜：根据鼠标水平方向决定，限制范围 */
+    //    把 dx 单独归一化（-1..1），再乘最大角度，效果比直接用 angle 更稳。
+    const headTilt = clamp((dx / FOLLOW_DISTANCE) * MAX_HEAD_TILT * 1.5, MAX_HEAD_TILT);
+    head.style.setProperty('--head-tilt', headTilt.toFixed(2) + 'deg');
+
+    /* 6. 瞳孔位移：在椭圆轨迹上沿 angle 方向走 dist 比例。
+          由于头部本身在旋转，理论上应把方向反向旋转 -headTilt，
+          但因为倾斜很小，肉眼几乎察觉不到，省掉这一步保持代码简洁。 */
+    const px = Math.cos(angle) * MAX_PUPIL_OFFSET_X * dist;
+    const py = Math.sin(angle) * MAX_PUPIL_OFFSET_Y * dist;
+
+    pupils.forEach(p => {
+      p.style.setProperty('--pupil-x', px.toFixed(2) + 'px');
+      p.style.setProperty('--pupil-y', py.toFixed(2) + 'px');
+    });
+  }
+
+  /* ----- 事件监听 ----- */
+  window.addEventListener('mousemove', e => follow(e.clientX, e.clientY));
+
+  // 触摸设备也支持
+  window.addEventListener('touchmove', e => {
+    if (e.touches && e.touches[0]) {
+      follow(e.touches[0].clientX, e.touches[0].clientY);
+    }
+  }, { passive: true });
+
+  /* ----- 离开窗口时眼睛归位，避免“僵硬地盯着角落” ----- */
+  window.addEventListener('mouseleave', () => {
+    head.style.setProperty('--head-tilt', '0deg');
+    pupils.forEach(p => {
+      p.style.setProperty('--pupil-x', '0px');
+      p.style.setProperty('--pupil-y', '0px');
+    });
+  });
+
+  /* ----- 随机眨眼：在 CSS 周期性眨眼基础上偶尔“补一下” -----
+     做法：临时给 .eye 加一个一次性 keyframe class，
+     通过 Web Animations API 触发，不干扰主 CSS 动画。 */
+  function randomBlink() {
+    document.querySelectorAll('.eye').forEach(eye => {
+      eye.animate(
+        [
+          { transform: 'scaleY(1)' },
+          { transform: 'scaleY(0.05)' },
+          { transform: 'scaleY(1)' },
+        ],
+        { duration: 220, easing: 'ease-in-out' }
+      );
+    });
+  }
+  // 每 3~7 秒随机眨一次
+  (function loopBlink() {
+    const next = 3000 + Math.random() * 4000;
+    setTimeout(() => { randomBlink(); loopBlink(); }, next);
+  })();
+
+  /* ----- 空格键手动眨眼 ----- */
+  window.addEventListener('keydown', e => {
+    if (e.code === 'Space') { e.preventDefault(); randomBlink(); }
+  });
+})();
+</script>
+</body>
+</html>
