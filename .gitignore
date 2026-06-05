@@ -3,6 +3,9 @@ __pycache__/
 *.pyc
 .env
 *.md
+!README.md
+!docs/
+!docs/**
 demo/es_milvus_DB/
 demo/.langgraph_api/
 .pytest_cache/
