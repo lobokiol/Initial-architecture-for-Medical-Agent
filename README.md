@@ -4,6 +4,11 @@
 
 后端通过 LangGraph 状态机编排多轮对话、症状问诊、流程检索与意图识别，前端则以 CLI 形式演示多会话聊天体验（类似 ChatGPT 的会话列表）。
 
+## 架构设计补充
+
+- 分层架构与业务流说明：[`docs/分层架构与腹痛业务流.md`](docs/分层架构与腹痛业务流.md)
+- 该文档补充了 `presentation -> application -> domain -> infrastructure -> mcp_servers` 的职责边界，并给出了“我肚子疼，该怎么办”的业务流图。
+
 ---
 web页面：
 
